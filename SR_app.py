@@ -9,40 +9,6 @@ import tensorflow as tf
 print('Current working directory:\n    {}\n'.format(os.getcwd()))
 MODEL_DIR = os.path.join(os.path.split(os.path.realpath(__file__))[0], 'SR_model')
 
-# flags
-FLAGS = tf.app.flags.FLAGS
-
-tf.app.flags.DEFINE_string('model_dir', MODEL_DIR,
-                           """Directory where the image files are to be processed.""")
-tf.app.flags.DEFINE_integer('scaling', 2,
-                            """Up-scaling factor of the model.""")
-tf.app.flags.DEFINE_string('src_dir', './',
-                           """Directory where the image files are to be processed.""")
-tf.app.flags.DEFINE_string('dst_dir', '{src_dir}/SR_results',
-                           """Directory where to write the processed images.""")
-tf.app.flags.DEFINE_string('dst_postfix', '.SR',
-                           """Postfix added to the processed filenames.""")
-tf.app.flags.DEFINE_boolean('recursive', True,
-                           """Recursively search all the files in 'src_dir'.""")
-tf.app.flags.DEFINE_string('data_format', 'NCHW', # 'NHWC'
-                            """Data layout format.""")
-tf.app.flags.DEFINE_integer('patch_height', 512,
-                            """Max patch height.""")
-tf.app.flags.DEFINE_integer('patch_width', 512,
-                            """Max patch width.""")
-tf.app.flags.DEFINE_integer('patch_pad', 8,
-                            """Padding around patches.""")
-tf.app.flags.DEFINE_integer('patch_mod', 8,
-                            """Mod of patches.""")
-tf.app.flags.DEFINE_integer('threads', 0,
-                            """Concurrent multi-threading Python execution.""")
-tf.app.flags.DEFINE_integer('sess_threads', 1,
-                            """Maximum number of concurrent running TensorFlow sessions.""")
-tf.app.flags.DEFINE_float('memory_fraction', 1.0,
-                            """Maximum allowed fraction of memory to allocate.""")
-tf.app.flags.DEFINE_string('device', 'GPU:0',
-                            """Preferred device to use.""")
-
 # stderr print
 def eprint(*args, **kwargs):
     import sys
@@ -243,29 +209,26 @@ def listdir_files(path, recursive=True, filter_ext=None, encoding=None):
     return files
 
 # main
-def main(argv=None):
-    from skimage import io
-    from skimage import transform
-    
-    FLAGS.dst_dir = FLAGS.dst_dir.format(src_dir=FLAGS.src_dir)
+def process(args):
+    from skimage import io, transform
     
     extensions = ['.jpeg', '.jpg', '.png', '.bmp', '.webp', '.tif', '.tiff', '.jp2']
-    dst_postfix = FLAGS.dst_postfix + '.png'
+    dst_postfix = args.dst_postfix + '.png'
     channel_index = -1
     # number of threads
-    if FLAGS.threads <= 0:
-        thread_num = max(1, os.cpu_count() - FLAGS.threads)
+    if args.threads <= 0:
+        num_threads = max(1, os.cpu_count() - args.threads)
     else:
-        thread_num = FLAGS.threads
+        num_threads = args.threads
     # directories and files
-    if not os.path.exists(FLAGS.dst_dir): os.makedirs(FLAGS.dst_dir)
-    src_files = listdir_files(FLAGS.src_dir, FLAGS.recursive, extensions)
+    if not os.path.exists(args.dst_dir): os.makedirs(args.dst_dir)
+    src_files = listdir_files(args.src_dir, args.recursive, extensions)
     # initialization
-    filter = SRFilter(FLAGS.model_dir, FLAGS.data_format, FLAGS.scaling,
-        FLAGS.sess_threads, FLAGS.memory_fraction, FLAGS.device)
+    filter = SRFilter(args.model_dir, args.data_format, args.scaling,
+        args.sess_threads, args.memory_fraction, args.device)
     # worker - read, process and save image files
     def worker(q, t):
-        msg = '{}: '.format(t) if thread_num > 1 else ''
+        msg = '{}: '.format(t) if num_threads > 1 else ''
         while True:
             # dequeue
             item = q.get()
@@ -282,14 +245,19 @@ def main(argv=None):
                 alpha = src[:, :, -1:]
                 src = src[:, :, :-1]
             # process
-            dst = filter.process(src, max_patch_height=FLAGS.patch_height, max_patch_width=FLAGS.patch_width,
-                patch_pad=FLAGS.patch_pad, patch_mod=FLAGS.patch_mod,
-                data_format='NHWC', msg=None if thread_num > 1 else True)
+            if num_threads == 1:
+                tick = time.time()
+            dst = filter.process(src, max_patch_height=args.patch_height, max_patch_width=args.patch_width,
+                patch_pad=args.patch_pad, patch_mod=args.patch_mod,
+                data_format='NHWC', msg=None if num_threads > 1 else True)
+            if num_threads == 1:
+                tock = time.time()
+                print('Process time: {}'.format(tock - tick))
             # process and merge alpha channel
             if channels == 2 or channels == 4:
                 dtype = alpha.dtype
                 bits = dtype.itemsize * 8
-                alpha = transform.rescale(alpha, FLAGS.scaling, mode='edge', preserve_range=True)
+                alpha = transform.rescale(alpha, args.scaling, mode='edge', preserve_range=True)
                 if bits < 32:
                     alpha = np.clip(alpha, 0, (1 << bits) - 1)
                     alpha = alpha.astype(dtype)
@@ -297,11 +265,11 @@ def main(argv=None):
                     alpha = np.clip(alpha, 0, 1)
                 dst = np.concatenate([dst, alpha], axis=channel_index)
             # save
-            save_dir = dir_path[len(FLAGS.src_dir):].strip('/').strip('\\')
-            save_dir = os.path.join(FLAGS.dst_dir, save_dir)
+            save_dir = dir_path[len(args.src_dir):].strip('/').strip('\\')
+            save_dir = os.path.join(args.dst_dir, save_dir)
             if not os.path.exists(save_dir): os.makedirs(save_dir)
             save_file = os.path.join(save_dir, file_name + dst_postfix)
-            if thread_num == 1: print(msg + 'Saving... {}'.format(save_file))
+            if num_threads == 1: print(msg + 'Saving... {}'.format(save_file))
             io.imsave(save_file, dst)
             print(msg + 'Result saved to {}'.format(save_file))
             # indicate enqueued task is complete
@@ -312,18 +280,60 @@ def main(argv=None):
         q.put(item)
     # start threads
     threads = []
-    for _ in range(thread_num):
+    for _ in range(num_threads):
         t = threading.Thread(target=lambda: worker(q, _))
         t.start()
         threads.append(t)
     # block until all tasks are done
     q.join()
     # stop workers
-    for i in range(thread_num):
+    for _ in range(num_threads):
         q.put(None)
     for t in threads:
         t.join()
 
-# tf main
+def main(argv):
+    import argparse
+    argp = argparse.ArgumentParser(argv[0])
+    # IO parameters
+    argp.add_argument('--model-dir', default=MODEL_DIR,
+        help="""Directory where the model files are located.""")
+    argp.add_argument('--src-dir', default='./',
+        help="""Directory where the image files are to be processed.""")
+    argp.add_argument('--dst-dir', default='{src_dir}/results',
+        help="""Directory where to write the processed images.""")
+    argp.add_argument('--dst-postfix', default='.SR',
+        help="""Postfix added to the processed filenames.""")
+    argp.add_argument('--recursive', default=False, action='store_true',
+        help="""Recursively search all the files in 'src_dir'.""")
+    argp.add_argument('--threads', type=int, default=0,
+        help="""Concurrent multi-threading Python execution.""")
+    # model parameters
+    argp.add_argument('--scaling', type=int, default=2,
+        help="""Up-scaling factor of the model.""")
+    argp.add_argument('--data-format', default='NCHW',
+        help="""Data layout format.""")
+    argp.add_argument('--sess-threads', type=int, default=1,
+        help="""Maximum number of concurrent running TensorFlow sessions.""")
+    argp.add_argument('--memory-fraction', type=float, default=1.0,
+        help="""Maximum allowed fraction of memory to allocate.""")
+    argp.add_argument('--device', default='GPU:0',
+        help="""Preferred device to use.""")
+    # data parameters
+    argp.add_argument('--patch-height', type=int, default=512,
+        help="""Max patch height.""")
+    argp.add_argument('--patch-width', type=int, default=512,
+        help="""Max patch width.""")
+    argp.add_argument('--patch-pad', type=int, default=8,
+        help="""Padding around patches.""")
+    argp.add_argument('--patch-mod', type=int, default=8,
+        help="""Mod of patches.""")
+    # parse
+    args = argp.parse_args(argv[1:])
+    args.dst_dir = args.dst_dir.format(src_dir=args.src_dir)
+    # run
+    process(args)
+
 if __name__ == '__main__':
-    tf.app.run()
+    import sys
+    main(sys.argv)
