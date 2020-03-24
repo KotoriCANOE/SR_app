@@ -5,19 +5,56 @@ import threading
 import numpy as np
 import tensorflow as tf
 
-# working directory
-print('Current working directory:\n    {}\n'.format(os.getcwd()))
-MODEL_DIR = os.path.join(os.path.split(os.path.realpath(__file__))[0], 'SR_model')
-
 # stderr print
 def eprint(*args, **kwargs):
     import sys
     print(*args, file=sys.stderr, **kwargs)
 
+# recursively list all the files' path under directory
+def listdir_files(path, recursive=True, filter_ext=None, encoding=None):
+    import os, locale
+    if encoding is True: encoding = locale.getpreferredencoding()
+    if filter_ext is not None: filter_ext = [e.lower() for e in filter_ext]
+    files = []
+    for (dir_path, dir_names, file_names) in os.walk(path):
+        for f in file_names:
+            if not filter_ext or os.path.splitext(f)[1].lower() in filter_ext:
+                file_path = os.path.join(dir_path, f)
+                try:
+                    if encoding: file_path = file_path.encode(encoding)
+                    files.append(file_path)
+                except UnicodeEncodeError as err:
+                    eprint(file_path)
+                    eprint(err)
+        if not recursive: break
+    files.sort()
+    return files
+
+# reset random seeds
+def reset_random(seed=0):
+    import random
+    tf.set_random_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+# setup tensorflow and return session
+def create_session(graph=None, debug=False, memory_fraction=1.0):
+    # create session
+    gpu_options = tf.GPUOptions(allow_growth=True,
+        per_process_gpu_memory_fraction=memory_fraction)
+    config = tf.ConfigProto(gpu_options=gpu_options,
+        allow_soft_placement=True, log_device_placement=False)
+    config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+    sess = tf.Session(graph=graph, config=config)
+    if debug:
+        from tensorflow.python import debug as tfdbg
+        sess = tfdbg.LocalCLIDebugWrapperSession(sess)
+    return sess
+
 # API
 class SRFilter:
-    def __init__(self, model_dir=MODEL_DIR, data_format='NCHW', scaling=2,
-                 sess_threads=1, memory_fraction=1.0, device='GPU:0'):
+    def __init__(self, data_format='NCHW', scaling=2,
+                 sess_threads=1, memory_fraction=1.0, device='GPU:0', random_seed=None):
         # arXiv 1509.09308
         # a new class of fast algorithms for convolutional neural networks using Winograd's minimal filtering algorithms
         os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
@@ -26,56 +63,44 @@ class SRFilter:
         self.scaling = scaling
         self.memory_fraction = memory_fraction
         self.device = '/device:{}'.format(device)
-        
-        self._create_graph()
-        self._create_session()
-        self._restore_graph(model_dir)
+        self.random_seed = random_seed
+
         self.semaphore = threading.Semaphore(value=sess_threads)
-    
-    def _create_graph(self):
+
+    def load_model(self, model_file):
+        if not isinstance(model_file, str):
+            raise TypeError('"model_file" should be the path to a model file')
+        elif os.path.isdir(model_file):
+            model_file = os.path.join(model_file, 'model.pb')
+        if not os.path.exists(model_file):
+            raise ValueError('model file not exists: "{}"'.format(model_file))
+        # initialize
+        if self.random_seed is not None:
+            reset_random(self.random_seed)
+        # build graph
         self.graph = tf.Graph()
-    
-    def _create_session(self):
-        gpu_options = tf.GPUOptions(allow_growth=True,
-            per_process_gpu_memory_fraction=self.memory_fraction)
-        config = tf.ConfigProto(gpu_options=gpu_options,
-            allow_soft_placement=True, log_device_placement=False)
-        self.sess = tf.Session(graph=self.graph, config=config)
-    
-    def _restore_graph(self, model_dir):
-        # load meta graph and restore variables
         with self.graph.as_default():
             with tf.device(self.device):
-                if os.path.isfile(model_dir):
-                    model_pb = model_dir
-                else:
-                    model_pb = os.path.join(model_dir, 'model.pb')
-                    model_meta = os.path.join(model_dir, 'model.meta')
-                if os.path.exists(model_pb):
+                # build input
+                self.infer_inputs = tf.placeholder(tf.float32, name='InferenceInput')
+                inputs = self.infer_inputs
+                # load model
+                with open(model_file, 'rb') as fd:
                     graph_def = tf.GraphDef()
-                    with open(model_pb, 'rb') as fd:
-                        graph_def.ParseFromString(fd.read())
-                    tf.import_graph_def(graph_def, name="")
-                    eprint('Loaded {}'.format(model_pb))
-                elif os.path.exists(model_meta):
-                    saver = tf.train.import_meta_graph(model_meta, clear_devices=True)
-                    if saver is None:
-                        raise ValueError('Failed to import meta graph!')
-                    saver.restore(self.sess, os.path.join(model_dir, 'model'))
-                    eprint('Loaded {}'.format(model_meta))
-                else:
-                    eprint('No model file is found!')
-        # access placeholders variables
-        self.input = self.graph.get_tensor_by_name('Input:0')
-        self.output = self.graph.get_tensor_by_name('Output:0')
-        self.graph.finalize()
-    
+                    graph_def.ParseFromString(fd.read())
+                outputs, = tf.import_graph_def(graph_def, name='',
+                    input_map={'Input:0': inputs}, return_elements=['Output:0'])
+                # build output
+                self.infer_outputs = outputs
+        # create session
+        self.sess = create_session(self.graph, memory_fraction=self.memory_fraction)
+
     def inference(self, input):
-        feed_dict = {self.input: input}
+        feed_dict = {self.infer_inputs: input}
         with self.semaphore:
-            output = self.sess.run(self.output, feed_dict)
+            output = self.sess.run(self.infer_outputs, feed_dict)
         return output
-    
+
     def process(self, src, max_patch_height=360, max_patch_width=360, patch_pad=8, patch_mod=8,
         data_format='NHWC', msg=None):
         assert isinstance(src, np.ndarray)
@@ -193,21 +218,6 @@ class SRFilter:
         # return
         return dst
 
-# recursively list all the files' path under directory
-def listdir_files(path, recursive=True, filter_ext=None, encoding=None):
-    import os, locale
-    if encoding is True: encoding = locale.getpreferredencoding()
-    if filter_ext is not None: filter_ext = [e.lower() for e in filter_ext]
-    files = []
-    for (dir_path, dir_names, file_names) in os.walk(path):
-        for f in file_names:
-            if os.path.splitext(f)[1].lower() in filter_ext:
-                file_path = os.path.join(dir_path, f)
-                if encoding: file_path = file_path.encode(encoding)
-                files.append((file_path, dir_path, os.path.splitext(f)[0]))
-        if not recursive: break
-    return files
-
 # main
 def process(args):
     from skimage import io, transform
@@ -224,8 +234,9 @@ def process(args):
     if not os.path.exists(args.dst_dir): os.makedirs(args.dst_dir)
     src_files = listdir_files(args.src_dir, args.recursive, extensions)
     # initialization
-    filter = SRFilter(args.model_dir, args.data_format, args.scaling,
-        args.sess_threads, args.memory_fraction, args.device)
+    filter = SRFilter(args.data_format, args.scaling,
+        args.sess_threads, args.memory_fraction, args.device, args.random_seed)
+    filter.load_model(args.model_file)
     # worker - read, process and save image files
     def worker(q, t):
         msg = '{}: '.format(t) if num_threads > 1 else ''
@@ -235,7 +246,9 @@ def process(args):
             if item is None:
                 break
             else:
-                file_path, dir_path, file_name = item
+                file_path = item
+                dir_path = os.path.dirname(file_path)
+                file_name = os.path.splitext(os.path.basename(file_path))[0]
             # read
             src = io.imread(file_path)
             print(msg + 'Loaded {}'.format(file_path))
@@ -296,8 +309,8 @@ def main(argv):
     import argparse
     argp = argparse.ArgumentParser(argv[0])
     # IO parameters
-    argp.add_argument('--model-dir', default=MODEL_DIR,
-        help="""Directory where the model files are located.""")
+    argp.add_argument('--model-file', default='model.pb',
+        help="""Path to the model file.""")
     argp.add_argument('--src-dir', default='./',
         help="""Directory where the image files are to be processed.""")
     argp.add_argument('--dst-dir', default='{src_dir}/results',
@@ -319,6 +332,8 @@ def main(argv):
         help="""Maximum allowed fraction of memory to allocate.""")
     argp.add_argument('--device', default='GPU:0',
         help="""Preferred device to use.""")
+    argp.add_argument('--random-seed', type=int,
+        help="""Initialize with a specific random seed.""")
     # data parameters
     argp.add_argument('--patch-height', type=int, default=512,
         help="""Max patch height.""")
