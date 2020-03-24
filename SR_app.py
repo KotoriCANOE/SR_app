@@ -165,7 +165,7 @@ class SRFilter:
             src_patches.append(src[:, :, p_h : p_h + patch_h, p_w : p_w + patch_w])
         # inference
         if msg or msg == '':
-            eprint(msg + 'Inferencing using model...')
+            print(msg + 'Inferencing using model...')
             _t = time.time()
         dst_patches = []
         for src_p in src_patches:
@@ -177,7 +177,7 @@ class SRFilter:
             dst_patches.append(dst_p)
         if msg or msg == '':
             _d = time.time() - _t
-            eprint(msg + 'Inferencing finished. Duration: {} seconds.'.format(_d))
+            print(msg + 'Inferencing finished. Duration: {} seconds.'.format(_d))
         # cropping
         for s in range(splits):
             crop_t = (pad_h[0] if s // split_w == 0 else patch_pad) * self.scaling
