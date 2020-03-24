@@ -67,7 +67,7 @@ class SRFilter:
 
         self.semaphore = threading.Semaphore(value=sess_threads)
 
-    def load_model(self, model_file, data_format=None, dtype=tf.float32, int_range=None):
+    def load_model(self, model_file, data_format='NCHW', dtype=tf.float32, int_range=None):
         if not isinstance(model_file, str):
             raise TypeError('"model_file" should be the path to a model file')
         elif os.path.isdir(model_file):
@@ -77,8 +77,6 @@ class SRFilter:
         # initialize
         if self.random_seed is not None:
             reset_random(self.random_seed)
-        # static input
-        self.static_input = data_format is not None
         # build graph
         self.graph = tf.Graph()
         with self.graph.as_default():
@@ -86,8 +84,7 @@ class SRFilter:
                 # build input
                 self.infer_inputs = tf.placeholder(dtype, name='InferenceInput')
                 inputs = self.infer_inputs
-                if self.static_input:
-                    inputs = self.build_input(inputs, data_format, dtype, int_range)
+                inputs = self.build_input(inputs, data_format, dtype, int_range)
                 # load model
                 with open(model_file, 'rb') as fd:
                     graph_def = tf.GraphDef()
@@ -95,8 +92,7 @@ class SRFilter:
                 outputs, = tf.import_graph_def(graph_def, name='',
                     input_map={'Input:0': inputs}, return_elements=['Output:0'])
                 # build output
-                if self.static_input:
-                    outputs = self.build_output(outputs, data_format, dtype, int_range)
+                outputs = self.build_output(outputs, data_format, dtype, int_range)
                 self.infer_outputs = tf.identity(outputs, name='InferenceOutput')
         # create session
         self.sess = create_session(self.graph, memory_fraction=self.memory_fraction)
@@ -186,14 +182,6 @@ class SRFilter:
                              'If it\'s an image with alpha channel, '
                              'you should process the alpha channel separately using other resizers.'
                              .format(src_channels))
-        # convert to float32
-        src_dtype = src.dtype
-        if src_dtype != np.float32:
-            src = src.astype(np.float32)
-            if src_dtype == np.uint8:
-                src *= 1 / 255
-            elif src_dtype == np.uint16:
-                src *= 1 / 65535
         # parameters
         shape = src.shape
         height = shape[2]
@@ -257,15 +245,6 @@ class SRFilter:
             s = s_h * split_w
             dst_patches_h.append(np.concatenate(dst_patches[s : s + split_w], axis=-1))
         dst = np.concatenate(dst_patches_h, axis=-2)
-        # clipping output value
-        dst = np.clip(dst, 0, 1)
-        # convert to src_type
-        if src_dtype != np.float32:
-            if src_dtype == np.uint8:
-                dst *= 255
-            elif src_dtype == np.uint16:
-                dst *= 65535
-            dst = dst.astype(src_dtype)
         # reshape to src_shape
         if src_channels == 1:
             dst = dst[:, :1, :, :]
@@ -297,7 +276,7 @@ def process(args):
     # initialization
     filter = SRFilter(args.data_format, args.scaling,
         args.sess_threads, args.memory_fraction, args.device, args.random_seed)
-    filter.load_model(args.model_file, 'HWC', tf.uint8)
+    filter.load_model(args.model_file, 'NCHW', tf.uint8)
     # worker - read, process and save image files
     def worker(q, t):
         msg = '{}: '.format(t) if num_threads > 1 else ''
@@ -321,10 +300,9 @@ def process(args):
             # process
             if num_threads == 1:
                 tick = time.time()
-            dst = filter.inference(src)
-            # dst = filter.process(src, max_patch_height=args.patch_height, max_patch_width=args.patch_width,
-            #     patch_pad=args.patch_pad, patch_mod=args.patch_mod,
-            #     data_format='NHWC', msg=None if num_threads > 1 else True)
+            dst = filter.process(src, max_patch_height=args.patch_height, max_patch_width=args.patch_width,
+                patch_pad=args.patch_pad, patch_mod=args.patch_mod,
+                data_format='NHWC', msg=None if num_threads > 1 else True)
             if num_threads == 1:
                 tock = time.time()
                 print('Process time: {}'.format(tock - tick))
