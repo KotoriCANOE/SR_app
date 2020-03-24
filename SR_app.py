@@ -67,7 +67,7 @@ class SRFilter:
 
         self.semaphore = threading.Semaphore(value=sess_threads)
 
-    def load_model(self, model_file):
+    def load_model(self, model_file, data_format=None, dtype=tf.float32, int_range=None):
         if not isinstance(model_file, str):
             raise TypeError('"model_file" should be the path to a model file')
         elif os.path.isdir(model_file):
@@ -77,13 +77,17 @@ class SRFilter:
         # initialize
         if self.random_seed is not None:
             reset_random(self.random_seed)
+        # static input
+        self.static_input = data_format is not None
         # build graph
         self.graph = tf.Graph()
         with self.graph.as_default():
             with tf.device(self.device):
                 # build input
-                self.infer_inputs = tf.placeholder(tf.float32, name='InferenceInput')
+                self.infer_inputs = tf.placeholder(dtype, name='InferenceInput')
                 inputs = self.infer_inputs
+                if self.static_input:
+                    inputs = self.build_input(inputs, data_format, dtype, int_range)
                 # load model
                 with open(model_file, 'rb') as fd:
                     graph_def = tf.GraphDef()
@@ -91,15 +95,72 @@ class SRFilter:
                 outputs, = tf.import_graph_def(graph_def, name='',
                     input_map={'Input:0': inputs}, return_elements=['Output:0'])
                 # build output
-                self.infer_outputs = outputs
+                if self.static_input:
+                    outputs = self.build_output(outputs, data_format, dtype, int_range)
+                self.infer_outputs = tf.identity(outputs, name='InferenceOutput')
         # create session
         self.sess = create_session(self.graph, memory_fraction=self.memory_fraction)
 
-    def inference(self, input):
-        feed_dict = {self.infer_inputs: input}
+    @staticmethod
+    def build_input(inputs, data_format, dtype, int_range=None):
+        # convert data format
+        data_format = data_format.upper()
+        if 'N' not in data_format:
+            inputs = tf.expand_dims(inputs, axis=0)
+        if 'C' not in data_format:
+            inputs = tf.expand_dims(inputs, axis=1)
+        elif 'HWC' in data_format:
+            # expand channel dimension if not exists
+            inputs = tf.cond(tf.shape(tf.shape(inputs))[0] > 3,
+                lambda: inputs, lambda: tf.expand_dims(inputs, axis=3))
+            inputs = tf.transpose(inputs, (0, 3, 1, 2))
+        elif 'CHW' in data_format:
+            # expand channel dimension if not exists
+            inputs = tf.cond(tf.shape(tf.shape(inputs))[0] > 3,
+                lambda: inputs, lambda: tf.expand_dims(inputs, axis=1))
+        # convert data type and range
+        if dtype == tf.float32:
+            pass
+        elif dtype.is_floating:
+            inputs = tf.cast(inputs, tf.float32)
+        elif dtype.is_integer:
+            inputs = tf.cast(inputs, tf.float32)
+            dmin, dmax = dtype.limits if int_range is None else int_range
+            inputs = (inputs - dmin) * (1 / (dmax - dmin))
+        # duplicate 1-channel input to 3-channel
+        inputs = tf.cond(tf.shape(inputs)[1] > 1, lambda: inputs,
+            lambda: tf.concat([inputs, inputs, inputs], axis=1))
+        # return
+        return inputs
+
+    @staticmethod
+    def build_output(outputs, data_format, dtype, int_range=None):
+        # clip output range
+        outputs = tf.clip_by_value(outputs, 0, 1)
+        # convert data type and range
+        if dtype == tf.float32:
+            pass
+        elif dtype.is_floating:
+            outputs = tf.cast(outputs, dtype)
+        elif dtype.is_integer:
+            dmin, dmax = dtype.limits if int_range is None else int_range
+            outputs = outputs * (dmax - dmin) + (dmin + 0.5)
+            outputs = tf.cast(outputs, dtype)
+        # convert data format
+        data_format = data_format.upper()
+        if 'HWC' in data_format:
+            outputs = tf.transpose(outputs, (0, 2, 3, 1))
+        if 'N' not in data_format:
+            outputs = tf.squeeze(outputs, axis=0)
+        # return
+        return outputs
+
+    def inference(self, inputs):
+        fetch = 'InferenceOutput:0'
+        feed_dict = {'InferenceInput:0': inputs}
         with self.semaphore:
-            output = self.sess.run(self.infer_outputs, feed_dict)
-        return output
+            outputs = self.sess.run(fetch, feed_dict)
+        return outputs
 
     def process(self, src, max_patch_height=360, max_patch_width=360, patch_pad=8, patch_mod=8,
         data_format='NHWC', msg=None):
@@ -236,7 +297,7 @@ def process(args):
     # initialization
     filter = SRFilter(args.data_format, args.scaling,
         args.sess_threads, args.memory_fraction, args.device, args.random_seed)
-    filter.load_model(args.model_file)
+    filter.load_model(args.model_file, 'HWC', tf.uint8)
     # worker - read, process and save image files
     def worker(q, t):
         msg = '{}: '.format(t) if num_threads > 1 else ''
@@ -260,9 +321,10 @@ def process(args):
             # process
             if num_threads == 1:
                 tick = time.time()
-            dst = filter.process(src, max_patch_height=args.patch_height, max_patch_width=args.patch_width,
-                patch_pad=args.patch_pad, patch_mod=args.patch_mod,
-                data_format='NHWC', msg=None if num_threads > 1 else True)
+            dst = filter.inference(src)
+            # dst = filter.process(src, max_patch_height=args.patch_height, max_patch_width=args.patch_width,
+            #     patch_pad=args.patch_pad, patch_mod=args.patch_mod,
+            #     data_format='NHWC', msg=None if num_threads > 1 else True)
             if num_threads == 1:
                 tock = time.time()
                 print('Process time: {}'.format(tock - tick))
@@ -335,9 +397,9 @@ def main(argv):
     argp.add_argument('--random-seed', type=int,
         help="""Initialize with a specific random seed.""")
     # data parameters
-    argp.add_argument('--patch-height', type=int, default=512,
+    argp.add_argument('--patch-height', type=int, default=1280,
         help="""Max patch height.""")
-    argp.add_argument('--patch-width', type=int, default=512,
+    argp.add_argument('--patch-width', type=int, default=1280,
         help="""Max patch width.""")
     argp.add_argument('--patch-pad', type=int, default=8,
         help="""Padding around patches.""")
