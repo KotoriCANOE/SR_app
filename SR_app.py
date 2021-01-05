@@ -3,7 +3,15 @@ import time
 import queue
 import threading
 import numpy as np
-import tensorflow as tf
+
+# import TensorFlow v1
+try:
+    import tensorflow.compat.v1 as tf
+    tf.disable_eager_execution()
+    print('Imported TF 1.x in compat mode with Eager disabled.')
+except ImportError:
+    import tensorflow as tf
+    print('Imported TF 1.x.')
 
 # stderr print
 def eprint(*args, **kwargs):
@@ -44,7 +52,7 @@ def create_session(graph=None, debug=False, memory_fraction=1.0):
         per_process_gpu_memory_fraction=memory_fraction)
     config = tf.ConfigProto(gpu_options=gpu_options,
         allow_soft_placement=True, log_device_placement=False)
-    config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+    # config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
     sess = tf.Session(graph=graph, config=config)
     if debug:
         from tensorflow.python import debug as tfdbg
@@ -53,13 +61,12 @@ def create_session(graph=None, debug=False, memory_fraction=1.0):
 
 # API
 class SRFilter:
-    def __init__(self, data_format='NCHW', scaling=2,
-                 sess_threads=1, memory_fraction=1.0, device='GPU:0', random_seed=None):
+    def __init__(self, scaling=2, random_seed=None,
+        memory_fraction=1.0, device='GPU:0', sess_threads=1):
         # arXiv 1509.09308
         # a new class of fast algorithms for convolutional neural networks using Winograd's minimal filtering algorithms
         os.environ['TF_ENABLE_WINOGRAD_NONFUSED'] = '1'
         
-        self.data_format = data_format
         self.scaling = scaling
         self.memory_fraction = memory_fraction
         self.device = '/device:{}'.format(device)
@@ -67,10 +74,13 @@ class SRFilter:
 
         self.semaphore = threading.Semaphore(value=sess_threads)
 
+    # data_format, dtype, int_range: input data format feed into the model
     def load_model(self, model_file, data_format='NCHW', dtype=tf.float32, int_range=None):
         if not isinstance(model_file, str):
             raise TypeError('"model_file" should be the path to a model file')
-        elif os.path.isdir(model_file):
+        if not os.path.exists(model_file):
+            model_file = os.path.join(os.path.split(os.path.realpath(__file__))[0], model_file)
+        if os.path.isdir(model_file):
             model_file = os.path.join(model_file, 'model.pb')
         if not os.path.exists(model_file):
             raise ValueError('model file not exists: "{}"'.format(model_file))
@@ -158,6 +168,7 @@ class SRFilter:
             outputs = self.sess.run(fetch, feed_dict)
         return outputs
 
+    # data_format: input data format feed into the function
     def process(self, src, max_patch_height=360, max_patch_width=360, patch_pad=8, patch_mod=8,
         data_format='NHWC', msg=None):
         assert isinstance(src, np.ndarray)
@@ -218,11 +229,7 @@ class SRFilter:
             _t = time.time()
         dst_patches = []
         for src_p in src_patches:
-            if self.data_format != 'NCHW':
-                src_p = src_p.transpose((0, 2, 3, 1))
             dst_p = self.inference(src_p)
-            if self.data_format != 'NCHW':
-                dst_p = dst_p.transpose((0, 3, 1, 2))
             dst_patches.append(dst_p)
         if msg or msg == '':
             _d = time.time() - _t
@@ -274,9 +281,9 @@ def process(args):
     if not os.path.exists(args.dst_dir): os.makedirs(args.dst_dir)
     src_files = listdir_files(args.src_dir, args.recursive, extensions)
     # initialization
-    filter = SRFilter(args.data_format, args.scaling,
-        args.sess_threads, args.memory_fraction, args.device, args.random_seed)
-    filter.load_model(args.model_file, 'NCHW', tf.uint8)
+    filter = SRFilter(args.scaling, args.random_seed,
+        args.memory_fraction, args.device, args.sess_threads)
+    filter.load_model(args.model_file, dtype=tf.uint8)
     # worker - read, process and save image files
     def worker(q, t):
         msg = '{}: '.format(t) if num_threads > 1 else ''
@@ -364,8 +371,6 @@ def main(argv):
     # model parameters
     argp.add_argument('--scaling', type=int, default=2,
         help="""Up-scaling factor of the model.""")
-    argp.add_argument('--data-format', default='NCHW',
-        help="""Data layout format.""")
     argp.add_argument('--sess-threads', type=int, default=1,
         help="""Maximum number of concurrent running TensorFlow sessions.""")
     argp.add_argument('--memory-fraction', type=float, default=1.0,
